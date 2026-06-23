@@ -19,7 +19,8 @@ pip install -r requirements.txt
 Then use the script by running
 
 ```bash
-python3 rerun_batch.py [-h] -b BAG_PATH [-m MEMORY_LIMIT] [--header_timestamp] [--urdf URDF] [--blueprints BLUEPRINTS]
+python3 rerun_batch.py [-h] -b BAG_PATH [-m MEMORY_LIMIT] [--header_timestamp]
+                                        [--urdf URDF] [--blueprints BLUEPRINTS]
 ```
 
 Once it starts it displays the controls, which allow to quit, pause, and change the current blueprint.
@@ -28,5 +29,6 @@ Once it starts it displays the controls, which allow to quit, pause, and change 
 
 Rerun has a filetype to save how the viewer is currently setup, which they call a 'Blueprint'.
 These blueprints allow to see the information in different ways, depending which container type is used.
+
 We can quickly change between blueprints by logging the files saved in the './blueprints' directory (or the one set in the --blueprints option).
 
