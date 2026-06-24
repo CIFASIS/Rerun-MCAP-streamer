@@ -1,3 +1,4 @@
+from typing import Iterator
 from collections import deque
 from pathlib import Path
 import time
@@ -9,11 +10,11 @@ import subprocess
 import trio
 import sys
 import curses
-from curses import textpad
+import curses.ascii
 
 import numpy as np
 
-from mcap.reader import make_reader
+from mcap.reader import make_reader, McapReader, DecodedMessageTuple
 from mcap_ros2.decoder import DecoderFactory
 from xacrodoc import XacroDoc
 from pytransform3d.urdf import UrdfTransformManager
@@ -29,26 +30,41 @@ CONTROLS_DESCRIPTION=\
 """Controls: 'q' to exit, 'p' to pause, 'c' to toggle blueprints.
 """
 
-image_stats = {
-    "curr_rgb_time": 0.0,
-    "curr_depth_time": 0.0,
-    "rgb_image_count": 0,
-    "depth_image_count": 0,
-}
+class ImageStats():
+    def __init__(self):
+        self.curr_rgb_time: float = 0.0
+        self.curr_depth_time: float = 0.0
+        self.rgb_image_count: int = 0
+        self.depth_image_count: int = 0
 
-app = {
-    "should_exit": False,
-    "pause_event": trio.Event(),
-    "curr_blueprint": 0,
-    "blueprints": [],
-}
+image_stats = ImageStats()
 
-def toggle_blueprint():
-    """Change between blueprints in the 'blueprint directory'"""
+class Application():
+    def __init__(self, blueprints_dir: Path, reader: McapReader, streamer: Iterator[DecodedMessageTuple]):
+        self.blueprints_dir = blueprints_dir
+        self.blueprints = [file for file in self.blueprints_dir.iterdir() if file.is_file()]
+        self.curr_blueprint = 0
 
-    global app
-    app['curr_blueprint'] = (app['curr_blueprint'] + 1) % len(app['blueprints'])
-    rr.log_file_from_path(app['blueprints'][app['curr_blueprint']])
+        self.pause_event = trio.Event()
+        self.pause_event.set()
+
+        self.popup_event = trio.Event()
+        self.popup_event.set()
+        
+        self.should_exit = False
+        self.reader = reader
+        self.streamer = streamer
+
+    def toggle_blueprint(self):
+        """Change between blueprints in the 'blueprint directory'"""
+
+        self.curr_blueprint = (self.curr_blueprint + 1) % len(self.blueprints)
+        blueprint = self.blueprints[self.curr_blueprint]
+        rr.log_file_from_path(blueprint)
+        print(f"Opening blueprint: {blueprint.stem}")
+
+app: Application
+
 
 class CursesCombinedRedirect:
     """Class that handles the text redirected from stdout"""
@@ -94,11 +110,87 @@ class StderrProxy:
     def flush(self): self.handler.flush()
 
 def recording_offset_time(secs: int):
+    if secs == 0:
+        return
+
     global image_stats
     global app
 
-    start_time = image_stats['curr_rgb_time'] + secs
-    app['streamer'] = app['reader'].iter_decoded_messages(start_time=start_time)
+    def floatsec_to_intnsec(float_sec):
+        int_sec = int(float_sec)
+        rem_sec = float_sec - int_sec
+        rem_nsec = int(rem_sec * int(1e9))
+        return (int_sec * int(1e9)) + rem_nsec
+
+    start_time = floatsec_to_intnsec(image_stats.curr_rgb_time) + secs*int(1e9)
+    app.streamer = app.reader.iter_decoded_messages(start_time=start_time)
+    print(f"Continuing stream from {start_time} ({secs} seconds)")
+
+async def handle_popup(stdscr):
+    app.popup_event = trio.Event()
+
+    height, width = stdscr.getmaxyx()
+
+    popup_h, popup_w = 3, width // 2
+
+    center_y = (height - popup_h) // 2
+    center_x = (width - popup_w) // 2
+
+    popup = curses.newwin(popup_h, popup_w, center_y, center_x) 
+
+    input_buffer: list[str] = []
+    backward = False
+    while True:
+        # doesnt block because of stdscr.nodelay(True)
+        try:
+            key = stdscr.getch()
+        except curses.error:
+            key = -1
+
+        if key in [curses.ascii.NL, curses.ascii.CR]: # Enter pressed
+            try:
+                if backward:
+                    time_offset = -1 * int("".join(input_buffer))
+                else:
+                    time_offset = int("".join(input_buffer))
+            except ValueError:
+                print("Invalid input for time offset!")
+                time_offset = 0
+            break
+        elif key in [curses.ascii.BS, curses.KEY_BACKSPACE, curses.ascii.DEL]: # Backspace pressed
+            try:
+                input_buffer.pop()
+            except IndexError: # list is empty
+                pass
+        elif curses.ascii.isdigit(key):
+            input_buffer.append(chr(key))
+        elif key == ord('-'):
+            backward = not backward # Toggle going backward or forward
+
+        popup.erase()
+        popup.box()
+        title = "Time offset: "
+        popup.addstr(1, 2, title, curses.A_BOLD)
+        if backward:
+            popup.addstr(1, 2 + len(title), "-" + "".join(input_buffer[:popup_w - len(title)]))
+        else:
+            popup.addstr(1, 2 + len(title), "".join(input_buffer[:popup_w - len(title)]))
+        popup.refresh()
+        await trio.sleep(0.1)
+    
+    popup.erase()
+    stdscr.touchwin()
+    stdscr.refresh()
+
+    app.popup_event.set()
+
+    return time_offset
+
+def kill_rerun_viewer():
+    import subprocess
+
+    # On linux
+    subprocess.run(["pkill", "-f", "rerun"])
 
 async def handle_input(stdscr, cancel_scope):
     """Handle the app input and stop the nursery on exit"""
@@ -111,32 +203,31 @@ async def handle_input(stdscr, cancel_scope):
             key = -1
 
         if key == ord('q') or key == ord('Q'):
-            app['should_exit'] = True
+            app.should_exit = True
+            rr.disconnect()
+            kill_rerun_viewer()
             cancel_scope.cancel() # Stop the nursery
             return
         elif key == ord('p'):
-            if app['pause_event'].is_set():
-                app['pause_event'] = trio.Event()
+            if app.pause_event.is_set(): # if not paused
+                app.pause_event = trio.Event()
+                print("Pausing!")
             else:
-                app['pause_event'].set()
+                app.pause_event.set()
+                print("Unpausing!")
         elif key == ord('c'):
-            toggle_blueprint()
+            app.toggle_blueprint()
         elif key == curses.KEY_LEFT:
             recording_offset_time(-10)
         elif key == curses.KEY_RIGHT:
             recording_offset_time(+10)
         elif key == ord('t'):
-            txtbox = textpad.Textbox(stdscr)
-
-            time_offset = txtbox.edit()
-            try:
-                time_offset = int(time_offset)
-            except ValueError:
-                continue
+            time_offset = await handle_popup(stdscr)
 
             recording_offset_time(time_offset)
+            pass
 
-        await trio.sleep(0.05)
+        await trio.sleep(0.1)
 
 def remove_ansi_escape_codes(text):
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
@@ -144,8 +235,11 @@ def remove_ansi_escape_codes(text):
 
 async def draw_loop(stdscr, control_win, stdout_win, redirect: CursesCombinedRedirect):
     """Function that handles the display of information to screen"""
-
+    
+    global app
     while True:
+        await app.popup_event.wait() # if in popup, wait until it ends to keep drawing
+
         _, width = stdscr.getmaxyx()
         stdout_height, _ = stdout_win.getmaxyx()
 
@@ -153,7 +247,8 @@ async def draw_loop(stdscr, control_win, stdout_win, redirect: CursesCombinedRed
         control_win.erase()
         control_win.box()
         control_win.addstr(1, 2, "CONTROLS", curses.A_BOLD)
-        control_win.addstr(2, 2, "Press 'p' to pause | Press 'c' to toggle blueprints | Press 'q' to exit")
+        control_win.addstr(2, 2, "'p' to pause | 'c' to toggle blueprints | 'q' to exit (kills rerun viewer)")
+        control_win.addstr(3, 2, "'Left arrow' to rewind 10 seconds | 'Right arrow' to advance 10 secs | 't' to input some time offset")
         control_win.noutrefresh()
 
         # stdout window
@@ -176,7 +271,6 @@ async def draw_loop(stdscr, control_win, stdout_win, redirect: CursesCombinedRed
 
             if idx >= max_visible_lines:
                 break
-
 
         stdout_win.noutrefresh()
 
@@ -231,12 +325,16 @@ async def run_curses(stdscr, bag_path: Path, options):
     try:
         with trio.CancelScope() as cancel_scope:
             async with trio.open_nursery() as nursery:
+                # Start the server that receives our logs
+                process = await trio.lowlevel.open_process(
+                        ["rerun", f"--memory-limit={options['memory_limit']}"],
+                        stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+                # Start the logging (and initialize 'app')
+                await nursery.start(stream_mcap, bag_path, options)
+
                 nursery.start_soon(handle_input, stdscr, cancel_scope)
                 nursery.start_soon(draw_loop, stdscr, control_win, stdout_win, redirect)
 
-                process = await trio.lowlevel.open_process("python3 init_rerun.py " + bag_path.stem + " " + options['memory_limit'],\
-                        shell=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-                nursery.start_soon(stream_mcap, bag_path, options)
                 nursery.start_soon(capture_process_stdout, process, redirect)
                 nursery.start_soon(capture_process_stderr, process, redirect)
 
@@ -266,7 +364,7 @@ def log_image(decoded_msg, channel):
     encoding = decoded_msg.encoding
 
     if encoding == "16UC1":
-        image_stats["depth_image_count"] += 1
+        image_stats.depth_image_count += 1
         raw_data = np.frombuffer(decoded_msg.data, dtype=np.uint16)
         img_tensor = raw_data.reshape((height, width))
 
@@ -280,14 +378,14 @@ def log_image(decoded_msg, channel):
         rr.log(channel.topic + '/image', rr.DepthImage(img_tensor, meter=1000))
 
         # Log FPS
-        (fps, time) = get_time_diff(decoded_msg, image_stats['curr_depth_time'])
-        image_stats['curr_depth_time'] = time
+        (fps, time) = get_time_diff(decoded_msg, image_stats.curr_depth_time)
+        image_stats.curr_depth_time = time
 
         rr.log('/stats/fps/depth', rr.Scalars(scalars=[fps]))
     else:
         raw_data = np.frombuffer(decoded_msg.data, dtype=np.uint8)
         if encoding in ("rgb8", "bgr8"):
-            image_stats['rgb_image_count'] += 1
+            image_stats.rgb_image_count += 1
             img_tensor = raw_data.reshape((height, width, 3))
 
             if encoding == "bgr8":
@@ -296,9 +394,9 @@ def log_image(decoded_msg, channel):
             rr.log(channel.topic + '/image', rr.Image(img_tensor))
             
             # Log FPS
-            (fps, time) = get_time_diff(decoded_msg, image_stats['curr_rgb_time'])
+            (fps, time) = get_time_diff(decoded_msg, image_stats.curr_rgb_time)
             # print(f"curr_rgb_time = {time}")
-            image_stats['curr_rgb_time'] = time
+            image_stats.curr_rgb_time = time
 
             rr.log('/stats/fps/color', rr.Scalars(scalars=[fps]))
         elif encoding in ("mono8", "8UC1"):
@@ -309,7 +407,7 @@ def log_image(decoded_msg, channel):
 
     rr.log(
         "stats/image_loss",
-        rr.Scalars(scalars=[abs(image_stats['rgb_image_count'] - image_stats['depth_image_count'])])
+        rr.Scalars(scalars=[abs(image_stats.rgb_image_count - image_stats.depth_image_count)])
     )
 
 def log_gnss(decoded_msg, channel):
@@ -437,26 +535,32 @@ def set_time(options, decoded_msg, msg):
 def to_ns(stamp):
     return stamp.sec * int(1e9) + stamp.nanosec
 
-async def stream_mcap(mcap_path: Path, options):
+async def stream_mcap(mcap_path: Path, options, *, task_status):
     """Loop that handles streaming the mcap into the rerun server"""
 
-    rr.init(mcap_path.stem)
-    rr.connect_grpc()
-
-    toggle_blueprint()
-    
-    print(f"Opening {mcap_path} for sequential streaming")
+    global app
 
     message_count = 0
     start_time = time.time()
 
+    print(f"Opening {mcap_path} for sequential streaming")
     with open(mcap_path, "rb") as f:
-        global app
         reader = make_reader(f, decoder_factories=[DecoderFactory()])
-        app['reader'] = reader
-        options['initial_time'] = reader.get_summary().statistics.message_start_time
-        options['final_time'] = reader.get_summary().statistics.message_end_time
-        options['time_diff'] = options['final_time'] - options['initial_time']
+        app = Application(options['blueprints'], reader, reader.iter_decoded_messages())
+
+        task_status.started()
+        await trio.sleep(0.0)
+
+        rr.init(mcap_path.stem)
+        rr.connect_grpc()
+
+        app.toggle_blueprint()
+    
+        summary = reader.get_summary()
+        if summary is not None and summary.statistics is not None:
+            options['initial_time'] = summary.statistics.message_start_time
+            options['final_time'] = summary.statistics.message_end_time
+            options['time_diff'] = options['final_time'] - options['initial_time']
 
         # Get robot transforms from input file
         if options['urdf'] is not None:
@@ -501,18 +605,17 @@ async def stream_mcap(mcap_path: Path, options):
             static=True
         )
 
-        app['streamer'] = reader.iter_decoded_messages()
-
         while True:
-            schema, channel, msg, decoded_msg = next(app['streamer'])
+            schema, channel, msg, decoded_msg = next(app.streamer)
             
-            if app['should_exit']:
+            if app.should_exit:
                 break
 
             # If pause is set, waits. Else, returns immediately
-            await app['pause_event'].wait()
+            await app.pause_event.wait()
 
-            if schema is None: continue
+            if schema is None:
+                continue
 
             set_time(options, decoded_msg, msg)
             match schema.name:
@@ -562,10 +665,7 @@ def main():
     options['memory_limit'] = args.memory_limit
     options['header_timestamp'] = args.header_timestamp
     options['urdf'] = args.urdf
-
-    global app
-    app['blueprints'] = [str(file) for file in args.blueprints.iterdir() if file.is_file()]
-    app['pause_event'].set()
+    options['blueprints'] = args.blueprints
 
     print("Starting stream")
     curses.wrapper(lambda stdscr: trio.run(run_curses, stdscr, args.bag_path, options))
