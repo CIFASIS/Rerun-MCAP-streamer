@@ -1,7 +1,8 @@
 import rerun as rr
 import sys
 
-memory_limit = sys.argv[1]
+recording_id = sys.argv[1]
+memory_limit = sys.argv[2]
 
-rr.init("batch_example")
+rr.init(recording_id)
 rr.spawn(memory_limit=memory_limit, connect=False)

@@ -93,7 +93,7 @@ class StderrProxy:
     def write(self, msg): self.handler.write_stderr(msg)
     def flush(self): self.handler.flush()
 
-async def recording_offset_time(secs: int):
+def recording_offset_time(secs: int):
     global image_stats
     global app
 
@@ -107,7 +107,7 @@ async def handle_input(stdscr, cancel_scope):
         # doesnt block because of stdscr.nodelay(True)
         try:
             key = stdscr.getch()
-        except:
+        except curses.error:
             key = -1
 
         if key == ord('q') or key == ord('Q'):
@@ -234,7 +234,7 @@ async def run_curses(stdscr, bag_path: Path, options):
                 nursery.start_soon(handle_input, stdscr, cancel_scope)
                 nursery.start_soon(draw_loop, stdscr, control_win, stdout_win, redirect)
 
-                process = await trio.lowlevel.open_process("python3 init_rerun.py " + options['memory_limit'],\
+                process = await trio.lowlevel.open_process("python3 init_rerun.py " + bag_path.stem + " " + options['memory_limit'],\
                         shell=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
                 nursery.start_soon(stream_mcap, bag_path, options)
                 nursery.start_soon(capture_process_stdout, process, redirect)
@@ -440,15 +440,12 @@ def to_ns(stamp):
 async def stream_mcap(mcap_path: Path, options):
     """Loop that handles streaming the mcap into the rerun server"""
 
-    # await trio.sleep(0.1)
-
-    rr.init("batch_example")
-    # rr.spawn(memory_limit=options['memory_limit'])
+    rr.init(mcap_path.stem)
     rr.connect_grpc()
 
     toggle_blueprint()
     
-    print(f"Opening {mcap_path} for sequential streaming");
+    print(f"Opening {mcap_path} for sequential streaming")
 
     message_count = 0
     start_time = time.time()
